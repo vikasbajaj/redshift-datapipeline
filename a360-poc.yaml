@@ -1,0 +1,400 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudTrail across all regions'
+Parameters:
+  RedshiftClusterIdentifier:
+    Description: Cluster Identifier for your redshift cluster
+    Type: String
+    Default: 'redshift-cluster-1'
+  DbUsername:
+    Description: Redshift database user name which has access to run SQL Script.
+    Type: String
+    AllowedPattern: "([a-z])([a-z]|[0-9])*"
+    Default: 'awsuser'
+  DatabaseName:
+    Description: Name of the Redshift database where SQL Script would be run.
+    Type: String
+    Default: 'dev'
+  RedshiftIAMRoleName:
+    Description: AWS IAM Role Name associated with the Redshift cluster
+    Type: String
+    Default: 'myRedshiftRole'
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Input Parameters"
+        Parameters:
+        - RedshiftClusterIdentifier
+        - DbUsername
+        - DatabaseName
+        - RedshiftIAMRoleName
+Resources:
+  LambdaRedshiftDataApiETLRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM Role for lambda to access Redshift and SNS topic
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            -
+              Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+      Path: /
+      Policies:
+          -
+            PolicyName: RedshiftAccessPolicy
+            PolicyDocument :
+              Version: 2012-10-17
+              Statement:
+                -
+                  Effect: Allow
+                  Action: redshift:GetClusterCredentials
+                  Resource:
+                    - !Sub arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:cluster:${RedshiftClusterIdentifier}
+                    - !Sub arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbname:${RedshiftClusterIdentifier}/${DatabaseName}
+                    - !Sub arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbuser:${RedshiftClusterIdentifier}/${DbUsername}
+                -
+                  Effect: "Allow"
+                  Action:
+                  - redshift-data:ExecuteStatement
+                  - redshift-data:ListStatements
+                  - redshift-data:GetStatementResult
+                  - redshift-data:DescribeStatement
+                  Resource: "*"
+                -
+                  Effect: "Allow"
+                  Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DeleteLogStream
+                  - logs:DeleteLogGroup
+                  Resource: "*"
+                -
+                  Effect: "Allow"
+                  Action:
+                  - s3:PutObject
+                  Resource:
+                  - "arn:aws:s3:::a36-manifest-bucket/*"
+  TrailBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties: {}
+  TrailBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AWSCloudTrailAclCheck
+          Effect: Allow
+          Principal:
+            Service: 'cloudtrail.amazonaws.com'
+          Action: 's3:GetBucketAcl'
+          Resource: !Sub 'arn:aws:s3:::${TrailBucket}'
+        - Sid: AWSCloudTrailWrite
+          Effect: Allow
+          Principal:
+            Service: 'cloudtrail.amazonaws.com'
+          Action: 's3:PutObject'
+          Resource: !Sub 'arn:aws:s3:::${TrailBucket}/AWSLogs/${AWS::AccountId}/*'
+          Condition:
+            StringEquals:
+              's3:x-amz-acl': 'bucket-owner-full-control'
+  Trail:
+    Type: 'AWS::CloudTrail::Trail'
+    DependsOn: TrailBucketPolicy
+    Properties:
+      IncludeGlobalServiceEvents: false
+      IsLogging: true
+      IsMultiRegionTrail: false
+      EventSelectors:
+      - IncludeManagementEvents: false
+        DataResources:
+        - Type: 'AWS::S3::Object'
+          Values:
+          - 'arn:aws:s3:::my-us-west-2-bkt/'
+        ReadWriteType: WriteOnly
+      S3BucketName: !Ref TrailBucket
+      EnableLogFileValidation: false
+  LambdaFunctionLoadRedshiftData:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Function that is called by EventBridge and loads data from S3 CSV to Redshift cluster.
+      Handler: index.handler
+      Role: !GetAtt 'LambdaRedshiftDataApiETLRole.Arn'
+      Runtime: python3.7
+      Timeout: 900
+      Environment:
+        Variables:
+          redshift_cluster_id: !Ref RedshiftClusterIdentifier
+          redshift_database: !Ref DatabaseName
+          redshift_user: !Ref DbUsername
+          redshift_cluster_iam_role: !Ref RedshiftIAMRoleName
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import unicodedata
+          import traceback
+          import sys
+          import os
+          from pip._internal import main
+
+          # install latest version of boto3
+          main(['install', '-I', '-q', 'boto3', '--target', '/tmp/', '--no-cache-dir', '--disable-pip-version-check'])
+          sys.path.insert(0,'/tmp/')
+          import boto3
+          import cfnresponse
+          import logging
+
+          logging.basicConfig()
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.INFO)
+
+          # initiate redshift-data client in boto3
+          client = boto3.client("redshift-data")
+
+          def handler(event, context):
+            print(json.dumps(event))
+            print("-----------------------------------")
+            bucket_name = event['detail']['requestParameters']['bucketName']
+            file_name = event['detail']['requestParameters']['key']
+            print(bucket_name)
+            print(file_name)
+            load_file = 's3://{0}/{1}'.format(bucket_name,file_name)
+            print(load_file)
+            
+            redshift_database = os.environ['redshift_database']
+            redshift_user = os.environ['redshift_user']
+            redshift_cluster_id = os.environ['redshift_cluster_id']
+
+            #bucket and key name needs to be changed 
+            bucketName = 'a36-manifest-bucket'
+            keyName = 'loaddata.manifest'
+            content = '{"entries": [{"url":"s3://' + bucket_name + '/' + file_name + '","mandatory":true}]}'
+            json_content = json.loads(content)
+            s3_client = boto3.resource('s3')
+            response = s3_client.Object(bucketName, keyName).put(Body=json.dumps(json_content))
+            print(response)
+            sql_text = 'CALL load_segment_data();'
+            logger.info('executing the following query {0}'.format(sql_text))
+            
+            res = client.execute_statement(Database=redshift_database, DbUser=redshift_user, Sql=sql_text,
+                                            ClusterIdentifier=redshift_cluster_id, WithEvent=True)        
+            print(res)
+            query_id = res["Id"]
+            done = False
+            while not done:
+              time.sleep(1)
+              status = status_check(client, query_id)
+              if status in ("STARTED", "FAILED", "FINISHED"):
+                  print("status is: {}".format(status))
+                  break
+            return query_id
+
+          def status_check(client, query_id):
+              desc = client.describe_statement(Id=query_id)
+              status = desc["Status"]
+              if status == "FAILED":
+                  raise Exception('SQL query failed:' + query_id + ": " + desc["Error"])
+              return status.strip('"')  
+
+  SegmentDataRule:
+    Type: 'AWS::Events::Rule'
+    DependsOn: LambdaFunctionLoadRedshiftData
+    Properties:
+      State: ENABLED
+      EventPattern:
+        source:
+        - "aws.s3"
+        detail:
+          eventName:
+          - "PutObject"
+          requestParameters:
+            bucketName: 
+            - "my-us-west-2-bkt"
+      Targets:
+      - Id: LoadSegmentDataLambdaTarget
+        Arn: !GetAtt LambdaFunctionLoadRedshiftData.Arn
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref LambdaFunctionLoadRedshiftData
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt SegmentDataRule.Arn
+  
+  CustomLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM Role for lambda to access Redshift and SNS topic
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            -
+              Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+      Path: /
+      Policies:
+          -
+            PolicyName: RedshiftAccessPolicy
+            PolicyDocument :
+              Version: 2012-10-17
+              Statement:
+                -
+                  Effect: Allow
+                  Action: redshift:GetClusterCredentials
+                  Resource:
+                    - !Sub arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:cluster:${RedshiftClusterIdentifier}
+                    - !Sub arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbname:${RedshiftClusterIdentifier}/${DatabaseName}
+                    - !Sub arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbuser:${RedshiftClusterIdentifier}/${DbUsername}
+                -
+                  Effect: "Allow"
+                  Action:
+                  - redshift-data:ExecuteStatement
+                  - redshift-data:ListStatements
+                  - redshift-data:GetStatementResult
+                  - redshift-data:DescribeStatement
+                  Resource: "*"
+                -
+                  Effect: "Allow"
+                  Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DeleteLogStream
+                  - logs:DeleteLogGroup
+                  Resource: "*"
+                -
+                  Effect: "Allow"
+                  Action:
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                  - s3:ListObjects
+                  Resource: 
+                  - !Sub 'arn:aws:s3:::${TrailBucket}'
+                  - !Sub 'arn:aws:s3:::${TrailBucket}/*'
+  CustomLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    DependsOn: CustomLambdaFunctionRole
+    Properties:
+      Description: Lambda function to delete objects from the TrailBucket and create Redshift Table and a stored procedure
+      Handler: index.handler
+      Role: !GetAtt 'CustomLambdaFunctionRole.Arn'
+      Runtime: python3.7
+      Timeout: 900
+      Environment:
+        Variables:
+          redshift_cluster_id: !Ref RedshiftClusterIdentifier
+          redshift_database: !Ref DatabaseName
+          redshift_user: !Ref DbUsername
+          redshift_cluster_iam_role: !Ref RedshiftIAMRoleName
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import unicodedata
+          import traceback
+          import sys
+          import os
+          from pip._internal import main
+
+          # install latest version of boto3
+          main(['install', '-I', '-q', 'boto3', '--target', '/tmp/', '--no-cache-dir', '--disable-pip-version-check'])
+          sys.path.insert(0,'/tmp/')
+          
+          import boto3
+          import cfnresponse
+
+          # initiate redshift-data client in boto3
+          client = boto3.client("redshift-data")
+          
+          def handler(event, context):
+            redshift_database = os.environ['redshift_database']
+            redshift_user = os.environ['redshift_user']
+            redshift_cluster_id = os.environ['redshift_cluster_id']
+            redshift_cluster_iam_role = os.environ['redshift_cluster_iam_role']
+            try:
+                if event['RequestType'] == 'Create':
+                  sql_text = '''
+                      CREATE TABLE IF NOT EXISTS a360segmentdata
+                        (kruxuserid varchar(200),
+                          kruxpartnerid varchar(100),
+                          segmentid varchar(200))
+                          SORTKEY(segmentid);
+
+                      CREATE OR REPLACE PROCEDURE load_segment_data()
+                      AS $$
+                      BEGIN
+                        COPY a360segmentdata FROM 's3://a36-manifest-bucket/loaddata.manifest'
+                        IAM_ROLE '{}'
+                        manifest gzip region 'us-west-2' delimiter '^';
+                      END;
+                      $$ LANGUAGE plpgsql; 
+
+                      '''
+                  sql_text = sql_text.format(redshift_cluster_iam_role)
+                  res = client.execute_statement(Database=redshift_database, DbUser=redshift_user, Sql=sql_text,
+                                             ClusterIdentifier=redshift_cluster_id, WithEvent=True)
+                  print(res)
+                  query_id = res["Id"]
+                  done = False
+                  while not done:
+                      time.sleep(1)
+                      status = status_check(client, query_id)
+                      if status in ("STARTED", "FAILED", "FINISHED"):
+                          print("status is: {}".format(status))
+                          break
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': 'Create complete'})
+                if event['RequestType'] == 'Delete':
+                  sql_text = '''
+                      DROP PROCEDURE load_segment_data();
+                      DROP TABLE IF EXISTS a360segmentdata;
+                      '''
+                  res = client.execute_statement(Database=redshift_database, DbUser=redshift_user, Sql=sql_text,
+                                             ClusterIdentifier=redshift_cluster_id, WithEvent=True)
+                  print(res)
+                  query_id = res["Id"]
+                  done = False
+                  while not done:
+                      time.sleep(1)
+                      status = status_check(client, query_id)
+                      if status in ("STARTED", "FAILED", "FINISHED"):
+                          print("status is: {}".format(status))
+                          break
+                  
+                  bucket = event['ResourceProperties']['BucketName']
+                  s3 = boto3.resource('s3')
+                  bucket = s3.Bucket(bucket)
+                  for obj in bucket.objects.filter():
+                      s3.Object(bucket.name, obj.key).delete()
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': 'Create complete'})
+            except Exception as e:
+                print(e)
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': 'Create complete'})
+          def status_check(client, query_id):
+              desc = client.describe_statement(Id=query_id)
+              status = desc["Status"]
+              if status == "FAILED":
+                raise Exception('SQL query failed:' + query_id + ": " + desc["Error"])
+              return status.strip('"')
+  CustomCleanupBucketOnDelete:
+    Type: Custom::CleanupBucket
+    Properties:
+      ServiceToken: !GetAtt [CustomLambdaFunction, Arn]
+      BucketName: !Ref TrailBucket
